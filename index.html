@@ -127,8 +127,8 @@ channel=sb.channel('private-chat-'+roomHash,{config:{broadcast:{self:false,ack:t
 channel.on('broadcast',{event:'message'},async({payload})=>{try{await processIncoming(payload,'text')}catch(e){setStatus('Could not decrypt incoming message: '+e.message)}});
 channel.on('broadcast',{event:'photo'},async({payload})=>{try{await processIncoming(payload,'photo')}catch(e){setStatus('Could not receive photo: '+e.message)}});
 channel.on('broadcast',{event:'voice'},async({payload})=>{try{await processIncoming(payload,'voice')}catch(e){setStatus('Could not receive voice note: '+e.message)}});
-channel.on('broadcast',{event:'delivered'},({payload})=>{if(!payload||payload.from===senderId)return;const waiter=liveAckWaiters.get(payload.id);if(waiter)waiter(true);const el=pending.get(payload.id);if(el){if(el.textContent!=='Seen')el.textContent='Delivered';retryQueue.delete(payload.id);removeOutbox(payload.id);$('retry').disabled=retryQueue.size===0}else earlyDelivered.add(payload.id)});
-channel.on('broadcast',{event:'read'},({payload})=>{if(!payload||payload.from===senderId)return;const waiter=liveAckWaiters.get(payload.id);if(waiter)waiter(true);const el=pending.get(payload.id);if(el){el.textContent='Seen';pending.delete(payload.id);retryQueue.delete(payload.id);removeOutbox(payload.id);$('retry').disabled=retryQueue.size===0}else earlyRead.add(payload.id)});
+channel.on('broadcast',{event:'delivered'},({payload})=>{if(!payload||payload.from===senderId)return;const el=pending.get(payload.id);if(el&&el.textContent!=='Seen')el.textContent='Delivered';else if(!el)earlyDelivered.add(payload.id);});
+channel.on('broadcast',{event:'read'},({payload})=>{if(!payload||payload.from===senderId)return;const el=pending.get(payload.id);if(el){el.textContent='Seen';pending.delete(payload.id);}else earlyRead.add(payload.id)});
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&channel&&subscribed){const ids=roomMessages.filter(m=>!m.mine&&m.id).map(m=>m.id);if(ids.length)acknowledge(ids,'seen',true).catch(()=>{})}});
 channel.on('broadcast',{event:'delete-request'},({payload})=>{if(payload&&payload.from!==senderId&&payload.room===roomHash)checkDeleteStatus()});
 channel.on('broadcast',{event:'typing'},({payload})=>{if(payload&&payload.sender!==senderId){$('typing').textContent=payload.active?'Other participant is typing…':'';if(payload.active){clearTimeout(typingTimer);typingTimer=setTimeout(()=>$('typing').textContent='',2500)}}});
@@ -149,27 +149,30 @@ async function removeOutbox(id){try{if(roomHash)await dbDelete(OUTBOX_PREFIX+roo
 async function restoreOutbox(){if(!roomHash||!roomKey)return;try{const k=await deviceKey(),keys=await dbKeys(),prefix=OUTBOX_PREFIX+roomHash+':';for(const key of keys){if(typeof key!=='string'||!key.startsWith(prefix))continue;const id=key.slice(prefix.length);if(retryQueue.has(id)||pending.has(id))continue;try{const raw=await dbGet(key),item=JSON.parse(await decryptText(raw,k));if(!item.ts||Date.now()-item.ts>=86400000){await dbDelete(key);continue;}let el;if(item.kind==='photo'||item.kind==='voice'){const bytes=await decryptBytes(item.payload.data),blob=new Blob([bytes],{type:item.kind==='photo'?'image/jpeg':(item.payload.mime||'audio/webm')});el=item.kind==='photo'?addPhotoBubble(blob,true,item.ts,'Not saved · retry',id):addVoiceBubble(blob,blob.type,true,item.ts,'Not saved · retry',id)}else el=addBubble(item.text,true,item.ts,'Not saved · retry',id);pending.set(id,el);retryQueue.set(id,{...item,el});}catch(e){console.warn('Could not restore a local retry record',e)}}$('retry').disabled=retryQueue.size===0;}catch(e){console.warn('Local retry queue unavailable',e)}}
 function waitForLiveAck(id,ms=2200){return new Promise(resolve=>{let settled=false;const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);liveAckWaiters.delete(id);resolve(value)};const timer=setTimeout(()=>finish(false),ms);liveAckWaiters.set(id,finish)})}
 async function transmit(item){
-  const live=!!(channel&&subscribed);
   pending.set(item.id,item.el);
-  if(live&&partnerOnline()){
-    item.el.textContent='Sending live…';
+  // Durable server copy first: never report live delivery before the message is recoverable.
+  try{
+    if(item.el.isConnected)item.el.textContent='Saving securely…';
+    await persistMessage(item);
+    retryQueue.delete(item.id);
+    await removeOutbox(item.id);
+    $('retry').disabled=retryQueue.size===0;
+  }catch(e){
+    retryQueue.set(item.id,item);
+    try{await saveOutbox(item)}catch(storageError){console.warn('Could not persist encrypted retry record',storageError)}
+    $('retry').disabled=false;
+    if(item.el.isConnected)item.el.textContent='Not saved · retry';
+    setStatus('Message is kept for retry on this device; server save failed: '+e.message);
+    return;
+  }
+  if(item.el.isConnected)item.el.textContent='Queued · waiting for delivery';
+  setStatus('Encrypted message saved. Waiting for the other device to receive it.');
+  if(channel&&subscribed){
     const event=item.kind==='voice'?'voice':(item.kind==='photo'?'photo':'message');
-    const ackPromise=waitForLiveAck(item.id,2200);
     try{
       const result=await channel.send({type:'broadcast',event,payload:item.payload});
-      if(result==='ok'&&await ackPromise){if(item.el.textContent!=='Seen')item.el.textContent='Delivered';retryQueue.delete(item.id);await removeOutbox(item.id);$('retry').disabled=retryQueue.size===0;return}
-    }catch(e){const waiter=liveAckWaiters.get(item.id);if(waiter)waiter(false)}
-    item.el.textContent='Recipient did not acknowledge live delivery; saving offline backup…';
-  }else item.el.textContent='Recipient offline · saving encrypted message…';
-  try{
-    await persistMessage(item);
-    retryQueue.delete(item.id);await removeOutbox(item.id);$('retry').disabled=retryQueue.size===0;
-    if(item.el.isConnected)item.el.textContent='Queued · waiting for Seen';
-    setStatus('Encrypted offline message saved. It will be removed when Seen or after 24 hours.');
-  }catch(e){
-    retryQueue.set(item.id,item);try{await saveOutbox(item)}catch(storageError){console.warn('Could not persist encrypted retry record',storageError)}$('retry').disabled=false;
-    if(item.el.isConnected)item.el.textContent='Not saved · retry';
-    setStatus('Message may have reached the other phone, but offline backup failed: '+e.message);
+      if(result==='error')throw Error('Live delivery unavailable; server copy retained for retry.');
+    }catch(e){console.warn('Live send failed; server copy retained for sync',e)}
   }
 } async function sendMessage(){const text=$('message').value.trim();if(!text||!channel||!roomKey||!subscribed)return;const id=crypto.randomUUID(),ts=Date.now(),target=replyTarget?{id:replyTarget.id,text:replyTarget.text,sender:replyTarget.mine?'me':'partner'}:null;$('send').disabled=true;try{const data=await encryptText(text);const replyData=target?await encryptText(JSON.stringify(target)):null;const payload={id,sender:senderId,ts,data,...(replyData?{replyData}:{})};const el=pushMessage(text,true,ts,id,'Sending…',target);$('message').value='';setReplyTarget(null);await transmit({id,text,ts,payload,el})}catch(e){setStatus('Could not encrypt/send. Check browser support and connection.')}finally{$('send').disabled=!subscribed}} $('retry').onclick=async()=>{for(const item of [...retryQueue.values()])await transmit(item)}; $('reconnect').onclick=async()=>{if(!roomCode){await join();return}try{if(currentChatPin){setStatus('Reserving a connection slot…');const slot=await pinRequest('join',currentChatPin);$('room').value=slot.roomCode}else $('room').value=roomCode;setStatus('Reconnecting to the current room…');await join(true)}catch(e){setStatus(e.message||'Could not reserve a connection slot.')}}; $('cancelReply').onclick=()=>setReplyTarget(null); $('accentColor').addEventListener('input',e=>document.documentElement.style.setProperty('--accent',e.target.value));
 async function pinRequest(action,pin='',extra={}){const response=await fetch(PIN_API,{method:'POST',headers:{'Content-Type':'application/json','apikey':SUPABASE_PUBLISHABLE_KEY,'Authorization':'Bearer '+SUPABASE_PUBLISHABLE_KEY},body:JSON.stringify({action,pin,deviceId:senderId,...extra})});const data=await response.json().catch(()=>({}));if(!response.ok)throw Error(data.error||'PIN service request failed.');return data}
@@ -201,13 +204,14 @@ async function checkDeleteStatus(){
   }catch(e){if(/404|Room not found/i.test(e.message)){await finalizeDeletedChat();return;}console.warn('Delete status check failed',e);}
 }
 async function persistMessage(item){const kind=item.kind||'text';await chatApi('send',{id:item.id,sender:senderId,kind,payload:item.payload});}
-async function acknowledge(ids,status,serverBacked=false){
+async function acknowledge(ids,status,serverBacked=true){
   if(!ids.length||!roomCode)return;
+  // Persist the receipt before broadcasting it; live-only receipts can be lost.
+  if(serverBacked){try{await chatApi('ack',{ids,status});if(status==='seen')for(const id of ids)serverBackedIds.delete(id)}catch(e){console.warn('Server acknowledgement pending; it will be retried on sync',e);return;}}
   if(channel&&subscribed){const event=status==='seen'?'read':'delivered';for(const id of ids)channel.send({type:'broadcast',event,payload:{id,from:senderId,ts:Date.now()}}).catch(()=>{});}
-  if(serverBacked){try{await chatApi('ack',{ids,status});if(status==='seen')for(const id of ids)serverBackedIds.delete(id)}catch(e){console.warn('Offline queue acknowledgement pending',e)}}
 }
 function rememberSeen(id){seen.add(id);try{localStorage.setItem('private-chat-seen-'+roomHash,JSON.stringify([...seen].slice(-3000)))}catch{}}
-async function processIncoming(payload,kind,source='live'){if(!payload||payload.sender===senderId||!payload.id||seen.has(payload.id)||!payload.data)return;if(source==='server')serverBackedIds.add(payload.id);const ts=payload.ts||Date.now();if(kind==='text'){const text=await decryptText(payload.data);if(seen.has(payload.id))return;let replyTo=null;if(payload.replyData){try{replyTo=JSON.parse(await decryptText(payload.replyData))}catch{}}pushMessage(text,false,ts,payload.id,'Delivered',replyTo)}else{const bytes=await decryptBytes(payload.data);if(seen.has(payload.id))return;const blob=new Blob([bytes],{type:kind==='photo'?'image/jpeg':(payload.mime||'audio/webm')});rememberSeen(payload.id);roomMessages.push({id:payload.id,mine:false,ts,kind});if(kind==='photo')addPhotoBubble(blob,false,ts,'Delivered',payload.id);else addVoiceBubble(blob,blob.type,false,ts,'Delivered',payload.id)}rememberSeen(payload.id);await acknowledge([payload.id],document.visibilityState==='visible'?'seen':'delivered',source==='server')}
+async function processIncoming(payload,kind,source='live'){if(!payload||payload.sender===senderId||!payload.id||seen.has(payload.id)||!payload.data)return;if(source==='server')serverBackedIds.add(payload.id);const ts=payload.ts||Date.now();if(kind==='text'){const text=await decryptText(payload.data);if(seen.has(payload.id))return;let replyTo=null;if(payload.replyData){try{replyTo=JSON.parse(await decryptText(payload.replyData))}catch{}}pushMessage(text,false,ts,payload.id,'Delivered',replyTo)}else{const bytes=await decryptBytes(payload.data);if(seen.has(payload.id))return;const blob=new Blob([bytes],{type:kind==='photo'?'image/jpeg':(payload.mime||'audio/webm')});rememberSeen(payload.id);roomMessages.push({id:payload.id,mine:false,ts,kind});if(kind==='photo')addPhotoBubble(blob,false,ts,'Delivered',payload.id);else addVoiceBubble(blob,blob.type,false,ts,'Delivered',payload.id)}rememberSeen(payload.id);await acknowledge([payload.id],document.visibilityState==='visible'?'seen':'delivered',true)}
 async function syncFromServer(silent=false){if(!roomCode||!roomKey||!subscribed||receiptSyncBusy)return;receiptSyncBusy=true;try{const data=await chatApi('fetch');for(const row of data.messages||[]){if(row.sender_id===senderId){const el=pending.get(row.message_id);if(el){if(row.seen_at){el.textContent='Seen';pending.delete(row.message_id);retryQueue.delete(row.message_id);await removeOutbox(row.message_id)}else if(row.delivered_at){if(el.textContent!=='Seen')el.textContent='Delivered';retryQueue.delete(row.message_id);await removeOutbox(row.message_id)}}continue;}if(seen.has(row.message_id)){await acknowledge([row.message_id],'seen',true);continue;}if(row.payload){const payload=row.payload;payload.id=row.message_id;payload.sender=row.sender_id;payload.ts=payload.ts||new Date(row.created_at).getTime();await processIncoming(payload,row.kind,'server')}}if(!silent)setStatus('Connected. Pending offline messages synced.')}catch(e){if(!silent)setStatus('Connected, but offline sync failed: '+e.message)}finally{receiptSyncBusy=false}}
 async function connectUsingPin(pin){setStatus('Checking PIN with server…');const data=await pinRequest('join',pin);$('room').value=data.roomCode;currentChatPin=pin;await join();}
 $('create').onclick=async()=>{const b=$('create');b.disabled=true;setStatus('Creating your permanent chat PIN…');try{const data=await pinRequest('create');currentChatPin=data.pin;$('createdPin').textContent=data.pin;$('pinCreated').classList.remove('hidden');$('pinInput').value=data.pin;$('room').value=data.roomCode;await join();setStatus('Chat created and connected. Share the 6-digit PIN. Only two devices can be connected at once; any device can take a free slot.')}catch(e){setStatus(e.message||'Could not create chat PIN.')}finally{b.disabled=false}};
