@@ -222,3 +222,5 @@ $('clearHistory').onclick=async()=>{if(!confirm('Delete all locally saved chat h
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&subscribed)chatApi('touch').catch(()=>{})});
 async function boot(){try{await deviceKey();await loadRecords();}catch{}$('pinInput').value='';currentChatPin='';setStatus('Enter your 6-digit PIN to connect. It is not saved in this browser.');setConn('Offline')};$('pinInput').addEventListener('input',e=>e.target.value=e.target.value.replace(/\D/g,'').slice(0,6));boot();
 </script></body></html>
+
+<!-- Preview deployment trigger: video-call recovery test branch -->
