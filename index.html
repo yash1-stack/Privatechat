@@ -144,15 +144,31 @@ channel.on('broadcast',{event:'call-busy'},({payload})=>{if(payload&&payload.fro
 channel.on('presence',{event:'sync'},updatePartnerStatus);channel.on('presence',{event:'join'},updatePartnerStatus);channel.on('presence',{event:'leave'},updatePartnerStatus);
 channel.subscribe(async s=>{if(s==='SUBSCRIBED'){subscribed=true;setConn('Connected',true);setStatus('Connected. Messages are encrypted before sending.');$('startCall').disabled=false;$('startVideoCall').disabled=false;refreshAudioOutputs();$('reconnect').disabled=false;try{await channel.track({senderId,joinedAt:Date.now()})}catch(e){$('partnerStatus').textContent='⚪ Partner status unavailable; room messaging is still connected.'}updatePartnerStatus();if(pc&&callId){if(callRole==='caller')restartCallIce();else requestCallIceRecovery();}await restoreOutbox();if(retryQueue.size){for(const item of [...retryQueue.values()].sort((a,b)=>(a.ts||0)-(b.ts||0)))await transmit(item)}await syncFromServer();clearInterval(receiptSyncTimer);receiptSyncTimer=setInterval(()=>{if(subscribed)syncFromServer(true)},7000);try{await chatApi('touch')}catch{}clearInterval(activityTimer);activityTimer=setInterval(()=>{if(subscribed)chatApi('touch').catch(e=>{setStatus('Connection slot could not be renewed: '+e.message);if(/both slots are now occupied/i.test(e.message))$('leave').click();})},30*1000);clearInterval(deletePollTimer);deletePollTimer=setInterval(checkDeleteStatus,30000);checkDeleteStatus();$('send').disabled=false;$('message').disabled=false;$('pickGallery').disabled=false;$('pickCamera').disabled=false;$('sendPhoto').disabled=!selectedPhotoFile;$('recordVoice').disabled=false;$('message').focus()}else if(['CHANNEL_ERROR','TIMED_OUT','CLOSED'].includes(s)){subscribed=false;clearInterval(deletePollTimer);deletePollTimer=null;setConn(s==='CLOSED'?'Offline':'Reconnecting');setStatus('Connection interrupted ('+s+'). Rejoin the room if it does not recover.');$('send').disabled=true;$('pickGallery').disabled=true;$('pickCamera').disabled=true;$('sendPhoto').disabled=true;$('startCall').disabled=true;$('startVideoCall').disabled=true;if(pc&&callId)callStatus('Signaling interrupted. Keeping the call alive while reconnecting…');$('recordVoice').disabled=true;$('stopVoice').disabled=true;$('reconnect').disabled=false;updatePartnerStatus()}})
 }catch(e){setStatus(e.message||'Could not join room.');setConn('Offline')}}
-async function saveOutbox(item){const k=await deviceKey(),record={id:item.id,ts:item.ts,kind:item.kind||'text',text:item.text||'',payload:item.payload};const encrypted=await encryptText(JSON.stringify(record),k);await dbPut(OUTBOX_PREFIX+roomHash+':'+item.id,encrypted)}
-async function removeOutbox(id){try{if(roomHash)await dbDelete(OUTBOX_PREFIX+roomHash+':'+id)}catch(e){console.warn('Could not clear local retry record',e)}}
+async function saveOutbox(item,targetRoomHash=roomHash){const k=await deviceKey(),record={id:item.id,ts:item.ts,kind:item.kind||'text',text:item.text||'',payload:item.payload};const encrypted=await encryptText(JSON.stringify(record),k);await dbPut(OUTBOX_PREFIX+targetRoomHash+':'+item.id,encrypted)}
+async function removeOutbox(id,targetRoomHash=roomHash){try{if(targetRoomHash)await dbDelete(OUTBOX_PREFIX+targetRoomHash+':'+id)}catch(e){console.warn('Could not clear local retry record',e)}}
 async function restoreOutbox(){if(!roomHash||!roomKey)return;try{const k=await deviceKey(),keys=await dbKeys(),prefix=OUTBOX_PREFIX+roomHash+':';for(const key of keys){if(typeof key!=='string'||!key.startsWith(prefix))continue;const id=key.slice(prefix.length);if(retryQueue.has(id)||pending.has(id))continue;try{const raw=await dbGet(key),item=JSON.parse(await decryptText(raw,k));if(!item.ts||Date.now()-item.ts>=86400000){await dbDelete(key);continue;}let el;if(item.kind==='photo'||item.kind==='voice'){const bytes=await decryptBytes(item.payload.data),blob=new Blob([bytes],{type:item.kind==='photo'?'image/jpeg':(item.payload.mime||'audio/webm')});el=item.kind==='photo'?addPhotoBubble(blob,true,item.ts,'Not saved · retry',id):addVoiceBubble(blob,blob.type,true,item.ts,'Not saved · retry',id)}else el=addBubble(item.text,true,item.ts,'Not saved · retry',id);pending.set(id,el);retryQueue.set(id,{...item,el});}catch(e){console.warn('Could not restore a local retry record',e)}}$('retry').disabled=retryQueue.size===0;}catch(e){console.warn('Local retry queue unavailable',e)}}
 function waitForLiveAck(id,ms=2200){return new Promise(resolve=>{let settled=false;const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);liveAckWaiters.delete(id);resolve(value)};const timer=setTimeout(()=>finish(false),ms);liveAckWaiters.set(id,finish)})}
+async function persistMessageUntilSaved(item,targetRoomHash){
+  let attempts=0;
+  while(roomHash===targetRoomHash && Date.now()-(item.ts||Date.now())<86400000){
+    if(!subscribed){await new Promise(resolve=>setTimeout(resolve,1500));continue;}
+    try{await persistMessage(item);return;}
+    catch(e){
+      attempts++;
+      if(item.el?.isConnected&&item.el.textContent!=='Delivered'&&item.el.textContent!=='Seen')item.el.textContent='Sent · backup retry pending';
+      setStatus('Message is live; its encrypted server backup is retrying…');
+      const delay=Math.min(30000,1000*Math.pow(2,Math.min(attempts-1,5)));
+      await new Promise(resolve=>setTimeout(resolve,delay));
+    }
+  }
+  throw Error('Message backup stopped because the chat changed or the 24-hour retention window ended.');
+}
 async function transmit(item){
-  pending.set(item.id,item.el);
+  const targetRoomHash=roomHash;
+  pending.set(item.id,item);
   retryQueue.set(item.id,item);
-  // Keep an encrypted local recovery copy, but do not wait for the server before live delivery.
-  try{await saveOutbox(item)}catch(e){console.warn('Could not write local retry record before live send',e)}
+  // Save locally before live delivery; this copy survives a dropped connection.
+  try{await saveOutbox(item,targetRoomHash)}catch(e){console.warn('Could not write local retry record before live send',e)}
   let liveSent=false;
   if(channel&&subscribed){
     const event=item.kind==='voice'?'voice':(item.kind==='photo'?'photo':'message');
@@ -163,23 +179,54 @@ async function transmit(item){
   }
   if(item.el.isConnected&&item.el.textContent!=='Delivered'&&item.el.textContent!=='Seen')item.el.textContent=liveSent?'Sent · waiting for delivery':'Queued · waiting for delivery';
   setStatus(liveSent?'Sent live. Securing the recovery copy in the background…':'Saving encrypted message for delivery…');
-  // Persist in the background so server latency does not block the next message.
-  const persistTask=messagePersistQueue.then(()=>persistMessage(item));
+  // Keep server writes FIFO. A temporary server failure holds later backups behind this one.
+  const persistTask=messagePersistQueue.then(()=>persistMessageUntilSaved(item,targetRoomHash));
   messagePersistQueue=persistTask.catch(()=>{});
   persistTask.then(async()=>{
-    retryQueue.delete(item.id);
-    await removeOutbox(item.id);
+    if(roomHash===targetRoomHash)retryQueue.delete(item.id);
+    await removeOutbox(item.id,targetRoomHash);
     $('retry').disabled=retryQueue.size===0;
   }).catch(async e=>{
+    if(roomHash!==targetRoomHash)return;
     retryQueue.set(item.id,item);
-    try{await saveOutbox(item)}catch(storageError){console.warn('Could not persist encrypted retry record',storageError)}
+    try{await saveOutbox(item,targetRoomHash)}catch(storageError){console.warn('Could not persist encrypted retry record',storageError)}
     $('retry').disabled=false;
     if(item.el.isConnected&&item.el.textContent!=='Delivered'&&item.el.textContent!=='Seen')item.el.textContent=liveSent?'Sent · backup retry pending':'Not saved · retry';
-    setStatus(liveSent?'Message sent live; server backup will retry: '+e.message:'Message is kept for retry on this device; server save failed: '+e.message);
+    setStatus(liveSent?'Message sent live; server backup still needs retry: '+e.message:'Message is kept for retry on this device: '+e.message);
   });
 } async function sendMessage(){const text=$('message').value.trim();if(textSendBusy||!text||!channel||!roomKey||!subscribed)return;textSendBusy=true;const id=crypto.randomUUID(),ts=Date.now(),target=replyTarget?{id:replyTarget.id,text:replyTarget.text,sender:replyTarget.mine?'me':'partner'}:null;$('send').disabled=true;try{const data=await encryptText(text);const replyData=target?await encryptText(JSON.stringify(target)):null;const payload={id,sender:senderId,ts,data,...(replyData?{replyData}:{})};const el=pushMessage(text,true,ts,id,'Sending…',target);$('message').value='';setReplyTarget(null);await transmit({id,text,ts,payload,el})}catch(e){setStatus('Could not encrypt/send. Check browser support and connection.')}finally{textSendBusy=false;$('send').disabled=!subscribed}} $('retry').onclick=async()=>{for(const item of [...retryQueue.values()])await transmit(item)}; $('reconnect').onclick=async()=>{if(!roomCode){await join();return}try{if(currentChatPin){setStatus('Reserving a connection slot…');const slot=await pinRequest('join',currentChatPin);$('room').value=slot.roomCode}else $('room').value=roomCode;setStatus('Reconnecting to the current room…');await join(true)}catch(e){setStatus(e.message||'Could not reserve a connection slot.')}}; $('cancelReply').onclick=()=>setReplyTarget(null); $('accentColor').addEventListener('input',e=>document.documentElement.style.setProperty('--accent',e.target.value));
 async function pinRequest(action,pin='',extra={}){const response=await fetch(PIN_API,{method:'POST',headers:{'Content-Type':'application/json','apikey':SUPABASE_PUBLISHABLE_KEY,'Authorization':'Bearer '+SUPABASE_PUBLISHABLE_KEY},body:JSON.stringify({action,pin,deviceId:senderId,...extra})});const data=await response.json().catch(()=>({}));if(!response.ok)throw Error(data.error||'PIN service request failed.');return data}
-async function chatApi(action,extra={}){const response=await fetch(PIN_API,{method:'POST',headers:{'Content-Type':'application/json','apikey':SUPABASE_PUBLISHABLE_KEY,'Authorization':'Bearer '+SUPABASE_PUBLISHABLE_KEY},body:JSON.stringify({action,roomCode,deviceId:senderId,...extra})});const data=await response.json().catch(()=>({}));if(!response.ok)throw Error(data.error||('Chat sync failed ('+response.status+').'));return data}
+async function chatApi(action,extra={},attempt=0){
+  const controller=new AbortController();
+  const timeout=setTimeout(()=>controller.abort(),12000);
+  let response,data;
+  try{
+    response=await fetch(PIN_API,{method:'POST',headers:{'Content-Type':'application/json','apikey':SUPABASE_PUBLISHABLE_KEY,'Authorization':'Bearer '+SUPABASE_PUBLISHABLE_KEY},body:JSON.stringify({action,roomCode,deviceId:senderId,...extra}),signal:controller.signal});
+    data=await response.json().catch(()=>({}));
+  }catch(e){
+    const retryable=['send','fetch','ack','touch','delete-status'].includes(action);
+    if(retryable&&attempt===0&&(e.name==='AbortError'||e instanceof TypeError)){
+      await new Promise(resolve=>setTimeout(resolve,350));
+      return chatApi(action,extra,1);
+    }
+    if(e.name==='AbortError')throw Error('Server request timed out; the message backup will retry.');
+    throw e;
+  }finally{clearTimeout(timeout)}
+  if(!response.ok){
+    const message=data.error||('Chat sync failed ('+response.status+').');
+    if(response.status===403&&attempt===0&&action!=='touch'&&/not actively connected|not currently connected/i.test(message)){
+      await chatApi('touch');
+      return chatApi(action,extra,1);
+    }
+    const retryable=['send','fetch','ack','touch','delete-status'].includes(action);
+    if(retryable&&attempt===0&&(response.status===429||response.status>=500)){
+      await new Promise(resolve=>setTimeout(resolve,500));
+      return chatApi(action,extra,1);
+    }
+    throw Error(message);
+  }
+  return data;
+}
 async function finalizeDeletedChat(){
   const oldHash=roomHash;
   clearInterval(deletePollTimer);deletePollTimer=null;clearInterval(activityTimer);activityTimer=null;
@@ -214,11 +261,11 @@ async function acknowledge(ids,status,serverBacked=true){
   if(channel&&subscribed){const event=status==='seen'?'read':'delivered';for(const id of ids)channel.send({type:'broadcast',event,payload:{id,from:senderId,ts:Date.now()}}).catch(()=>{});}
 }
 function rememberSeen(id){seen.add(id);try{localStorage.setItem('private-chat-seen-'+roomHash,JSON.stringify([...seen].slice(-3000)))}catch{}}
-async function processIncoming(payload,kind,source='live'){if(!payload||payload.sender===senderId||!payload.id||seen.has(payload.id)||!payload.data)return;if(source==='server')serverBackedIds.add(payload.id);const ts=payload.ts||Date.now();if(kind==='text'){const text=await decryptText(payload.data);if(seen.has(payload.id))return;let replyTo=null;if(payload.replyData){try{replyTo=JSON.parse(await decryptText(payload.replyData))}catch{}}pushMessage(text,false,ts,payload.id,'Delivered',replyTo)}else{const bytes=await decryptBytes(payload.data);if(seen.has(payload.id))return;const blob=new Blob([bytes],{type:kind==='photo'?'image/jpeg':(payload.mime||'audio/webm')});rememberSeen(payload.id);roomMessages.push({id:payload.id,mine:false,ts,kind});if(kind==='photo')addPhotoBubble(blob,false,ts,'Delivered',payload.id);else addVoiceBubble(blob,blob.type,false,ts,'Delivered',payload.id)}rememberSeen(payload.id);await acknowledge([payload.id],document.visibilityState==='visible'?'seen':'delivered',true)}
+async function processIncoming(payload,kind,source='live',deferAck=false){if(!payload||payload.sender===senderId||!payload.id||seen.has(payload.id)||!payload.data)return;if(source==='server')serverBackedIds.add(payload.id);const ts=payload.ts||Date.now();if(kind==='text'){const text=await decryptText(payload.data);if(seen.has(payload.id))return;let replyTo=null;if(payload.replyData){try{replyTo=JSON.parse(await decryptText(payload.replyData))}catch{}}pushMessage(text,false,ts,payload.id,'Delivered',replyTo)}else{const bytes=await decryptBytes(payload.data);if(seen.has(payload.id))return;const blob=new Blob([bytes],{type:kind==='photo'?'image/jpeg':(payload.mime||'audio/webm')});rememberSeen(payload.id);roomMessages.push({id:payload.id,mine:false,ts,kind});if(kind==='photo')addPhotoBubble(blob,false,ts,'Delivered',payload.id);else addVoiceBubble(blob,blob.type,false,ts,'Delivered',payload.id)}rememberSeen(payload.id);if(!deferAck)await acknowledge([payload.id],document.visibilityState==='visible'?'seen':'delivered',true)}
 async function syncFromServer(silent=false){
   if(!roomCode||!roomKey||!subscribed||receiptSyncBusy)return;
   receiptSyncBusy=true;
-  const pendingSeenAcks=[];
+  const pendingSeenAcks=[],pendingDeliveredAcks=[];
   try{
     const data=await chatApi('fetch');
     for(const row of data.messages||[]){
@@ -231,7 +278,10 @@ async function syncFromServer(silent=false){
         continue;
       }
       if(seen.has(row.message_id)){
-        if(!row.seen_at)pendingSeenAcks.push(row.message_id);
+        if(!row.seen_at){
+          if(document.visibilityState==='visible')pendingSeenAcks.push(row.message_id);
+          else if(!row.delivered_at)pendingDeliveredAcks.push(row.message_id);
+        }
         continue;
       }
       if(row.payload){
@@ -239,10 +289,13 @@ async function syncFromServer(silent=false){
         payload.id=row.message_id;
         payload.sender=row.sender_id;
         payload.ts=payload.ts||new Date(row.created_at).getTime();
-        await processIncoming(payload,row.kind,'server');
+        await processIncoming(payload,row.kind,'server',true);
+        if(document.visibilityState==='visible')pendingSeenAcks.push(row.message_id);
+        else pendingDeliveredAcks.push(row.message_id);
       }
     }
     for(let i=0;i<pendingSeenAcks.length;i+=100)await acknowledge(pendingSeenAcks.slice(i,i+100),'seen',true);
+    for(let i=0;i<pendingDeliveredAcks.length;i+=100)await acknowledge(pendingDeliveredAcks.slice(i,i+100),'delivered',true);
     if(!silent)setStatus('Connected. Pending offline messages synced.');
   }catch(e){if(!silent)setStatus('Connected, but offline sync failed: '+e.message)}
   finally{receiptSyncBusy=false}
@@ -257,7 +310,7 @@ $('leave').onclick=async()=>{clearInterval(activityTimer);clearInterval(deletePo
 async function clearCurrentChat(){if(!roomHash){$('messages').replaceChildren();roomMessages=[];seen.clear();return}if(!confirm('Clear this chat history from this device only? The other phone and any server queue are not changed.'))return;const rows=(await dbGet(HISTORY_KEY)||[]).filter(r=>r.roomHash!==roomHash);await dbPut(HISTORY_KEY,rows);$('messages').replaceChildren();roomMessages=[];seen.clear();localStorage.removeItem('private-chat-seen-'+roomHash);renderHistory();setStatus('This chat was cleared from this device only.')}
 $('clearScreen').onclick=clearCurrentChat;$('deleteChat').onclick=async()=>{if(!roomCode||!subscribed){setStatus('Connect to the chat first.');return}if(!confirm('Request permanent deletion? The other participant must also confirm within 24 hours.'))return;const b=$('deleteChat');b.disabled=true;try{const result=await chatApi('delete-request');if(result.deleted){await finalizeDeletedChat();}else{setStatus('Your deletion confirmation is saved. The other participant will be notified; waiting for their confirmation.');if(channel&&subscribed)channel.send({type:'broadcast',event:'delete-request',payload:{from:senderId,room:roomHash,at:Date.now()}}).catch(()=>{});await checkDeleteStatus();}}catch(e){setStatus('Could not request deletion: '+e.message)}finally{b.disabled=false}};$('forgetPin').onclick=()=>{localStorage.removeItem(LAST_PIN_KEY);$('pinInput').value='';currentChatPin='';setStatus('Saved PIN removed from this device. The chat itself is not deleted.')};$('showHistory').onclick=()=>{$('history').classList.toggle('hidden');if(!$('history').classList.contains('hidden'))renderHistory()};$('historyFilter').oninput=renderHistory;
 $('clearHistory').onclick=async()=>{if(!confirm('Delete all locally saved chat history from this browser? This cannot be undone.'))return;await dbPut(HISTORY_KEY,[]);renderHistory();setStatus('All local history cleared from this browser.')};
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&subscribed){chatApi('touch').catch(()=>{});const ids=roomMessages.filter(m=>!m.mine&&m.id).map(m=>m.id);if(ids.length)acknowledge(ids,'seen',true).catch(()=>{})}});
+document.addEventListener('visibilitychange',async()=>{if(document.visibilityState==='visible'&&subscribed){try{await chatApi('touch')}catch(e){console.warn('Could not renew the chat slot on return to foreground',e);return}const ids=roomMessages.filter(m=>!m.mine&&m.id).map(m=>m.id);if(ids.length)await acknowledge(ids,'seen',true);await syncFromServer(true)}});
 async function boot(){try{await deviceKey();await loadRecords();}catch{}$('pinInput').value='';currentChatPin='';setStatus('Enter your 6-digit PIN to connect. It is not saved in this browser.');setConn('Offline')};$('pinInput').addEventListener('input',e=>e.target.value=e.target.value.replace(/\D/g,'').slice(0,6));boot();
 </script></body></html>
 
