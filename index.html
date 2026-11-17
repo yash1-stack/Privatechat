@@ -165,7 +165,7 @@ async function persistMessageUntilSaved(item,targetRoomHash){
 }
 async function transmit(item){
   const targetRoomHash=roomHash;
-  pending.set(item.id,item);
+  pending.set(item.id,item.el);
   retryQueue.set(item.id,item);
   // Save locally before live delivery; this copy survives a dropped connection.
   try{await saveOutbox(item,targetRoomHash)}catch(e){console.warn('Could not write local retry record before live send',e)}
