@@ -35,7 +35,7 @@ const DEVICE_ID_KEY='private-chat-device-id-v1';
 let senderId=localStorage.getItem(DEVICE_ID_KEY)||crypto.randomUUID();localStorage.setItem(DEVICE_ID_KEY,senderId);
 let sb=null,channel=null,roomKey=null,roomHash='',roomCode='',subscribed=false,typingTimer=null,typingLast=0,pending=new Map(),retryQueue=new Map(),earlyDelivered=new Set(),earlyRead=new Set(),seen=new Set(),roomMessages=[],replyTarget=null,liveAckWaiters=new Map(),activityTimer=null,deletePollTimer=null,receiptSyncTimer=null,receiptSyncBusy=false,lastDeletePromptAt='',deletePromptBusy=false,serverBackedIds=new Set(),messagePersistQueue=Promise.resolve(),textSendBusy=false,autoReconnectTimer=null,autoReconnectAttempts=0,reconnecting=false,manualDisconnect=false,realtimeSendQueue=Promise.resolve(),lastRealtimeSendAt=0,realtimeCooldownUntil=0;
 let pc=null,localCallStream=null,callRole='',callMuted=false,cameraOff=false,remoteStream=null,callId='',callMediaType='audio',incomingCallId='',incomingCallType='audio',activeFacingMode='user';
-const queuedIce=new Map();let iceRecoveryTimer=null;let iceRestarting=false;
+const queuedIce=new Map();let iceRecoveryTimer=null;let iceRestarting=false;let outgoingReceipts=[];
 const callConfig={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'},{urls:'stun:stun.cloudflare.com:3478'}]};
 function callStatus(t){const e=$('callStatus');if(e)e.textContent=t;}
 async function sendRealtime(event,payload){const target=channel;if(!target||!subscribed)throw Error('Realtime channel is not connected.');const run=async()=>{const wait=Math.max(0,400-(Date.now()-lastRealtimeSendAt));if(wait)await new Promise(resolve=>setTimeout(resolve,wait));if(channel!==target||!subscribed)throw Error('Realtime channel changed before sending.');const result=await target.send({type:'broadcast',event,payload});lastRealtimeSendAt=Date.now();return result;};const task=realtimeSendQueue.then(run,run);realtimeSendQueue=task.catch(()=>{});return task;}
@@ -105,7 +105,19 @@ async function startVoiceRecording(){
  }catch(e){stopMicTracks();recorder=null;$('voiceStatus').textContent=e?.name==='NotAllowedError'?'Microphone permission denied. Allow microphone access for this HTTPS site, then try again.':'Could not start microphone. Check browser permission and retry.';$('recordVoice').disabled=!subscribed;$('stopVoice').disabled=true}
 }
 function stopVoiceRecording(){if(recorder&&recorder.state==='recording'){clearTimeout(recordStopTimer);recorder.stop()}}
-function registerPending(id,el){if(!id||!el)return;pending.set(id,el);if(earlyRead.delete(id)){el.textContent='Seen';pending.delete(id);earlyDelivered.delete(id)}else if(earlyDelivered.delete(id)){if(el.textContent!=='Seen')el.textContent='Delivered'}}
+function registerPending(id,el){if(!id||!el)return;pending.set(id,el);if(earlyRead.delete(id)){applyReceipt(id,'seen');earlyDelivered.delete(id)}else if(earlyDelivered.delete(id)){applyReceipt(id,'delivered')}}
+function applyReceipt(id,status){
+ const entry=outgoingReceipts.find(x=>x.id===id&&x.roomHash===roomHash);
+ if(!entry){const el=pending.get(id);if(el){el.textContent=status==='seen'?'Seen':'Delivered';if(status==='seen')pending.delete(id)}else if(status==='seen')earlyRead.add(id);else earlyDelivered.add(id);return;}
+ if(status==='seen')entry.receipt='seen';else if(entry.receipt!=='seen')entry.receipt='delivered';
+ let blocked=false;
+ for(const item of outgoingReceipts.filter(x=>x.roomHash===roomHash).sort((a,b)=>a.ts-b.ts)){
+  if(blocked)continue;
+  if(item.receipt==='pending'){blocked=true;continue;}
+  const el=pending.get(item.id);
+  if(el){el.textContent=item.receipt==='seen'?'Seen':'Delivered';if(item.receipt==='seen')pending.delete(item.id)}
+ }
+}
 function pushMessage(text,mine,ts,id,state,replyTo=null){if(seen.has(id))return null;seen.add(id);roomMessages.push({text,mine,ts,id,state,replyTo});const el=addBubble(text,mine,ts,state,id,replyTo);if(mine)registerPending(id,el);saveLocal({id,roomHash,roomLabel:roomCode.slice(0,8)+'…',ts,mine,text});return el}
 function addPhotoBubble(blob,mine,ts,state='',id=''){
  const wrap=document.createElement('div');wrap.className='msg'+(mine?' mine':'');
@@ -130,10 +142,10 @@ channel=sb.channel('private-chat-'+roomHash,{config:{broadcast:{self:false,ack:t
 channel.on('broadcast',{event:'message'},async({payload})=>{try{await processIncoming(payload,'text')}catch(e){setStatus('Could not decrypt incoming message: '+e.message)}});
 channel.on('broadcast',{event:'photo'},async({payload})=>{try{await processIncoming(payload,'photo')}catch(e){setStatus('Could not receive photo: '+e.message)}});
 channel.on('broadcast',{event:'voice'},async({payload})=>{try{await processIncoming(payload,'voice')}catch(e){setStatus('Could not receive voice note: '+e.message)}});
-channel.on('broadcast',{event:'delivered'},({payload})=>{if(!payload||payload.from===senderId)return;const el=pending.get(payload.id);if(el&&el.textContent!=='Seen')el.textContent='Delivered';else if(!el)earlyDelivered.add(payload.id);});
-channel.on('broadcast',{event:'read'},({payload})=>{if(!payload||payload.from===senderId)return;const el=pending.get(payload.id);if(el){el.textContent='Seen';pending.delete(payload.id);}else earlyRead.add(payload.id)});
-channel.on('broadcast',{event:'delivered-batch'},({payload})=>{if(!payload||payload.from===senderId||!Array.isArray(payload.ids))return;for(const id of payload.ids){const el=pending.get(id);if(el&&el.textContent!=='Seen')el.textContent='Delivered';else if(!el)earlyDelivered.add(id)}});
-channel.on('broadcast',{event:'read-batch'},({payload})=>{if(!payload||payload.from===senderId||!Array.isArray(payload.ids))return;for(const id of payload.ids){const el=pending.get(id);if(el){el.textContent='Seen';pending.delete(id)}else earlyRead.add(id)}});
+channel.on('broadcast',{event:'delivered'},({payload})=>{if(!payload||payload.from===senderId)return;applyReceipt(payload.id,'delivered')});
+channel.on('broadcast',{event:'read'},({payload})=>{if(!payload||payload.from===senderId)return;applyReceipt(payload.id,'seen')});
+channel.on('broadcast',{event:'delivered-batch'},({payload})=>{if(!payload||payload.from===senderId||!Array.isArray(payload.ids))return;for(const id of payload.ids)applyReceipt(id,'delivered')});
+channel.on('broadcast',{event:'read-batch'},({payload})=>{if(!payload||payload.from===senderId||!Array.isArray(payload.ids))return;for(const id of payload.ids)applyReceipt(id,'seen')});
 
 channel.on('broadcast',{event:'delete-request'},({payload})=>{if(payload&&payload.from!==senderId&&payload.room===roomHash)checkDeleteStatus()});
 channel.on('broadcast',{event:'typing'},({payload})=>{if(payload&&payload.sender!==senderId){$('typing').textContent=payload.active?'Other participant is typing…':'';if(payload.active){clearTimeout(typingTimer);typingTimer=setTimeout(()=>$('typing').textContent='',2500)}}});
@@ -171,6 +183,7 @@ async function persistMessageUntilSaved(item,targetRoomHash){
 async function transmit(item){
   const targetRoomHash=roomHash;
   registerPending(item.id,item.el);
+  if(!outgoingReceipts.some(x=>x.id===item.id&&x.roomHash===targetRoomHash))outgoingReceipts.push({id:item.id,ts:item.ts||Date.now(),roomHash:targetRoomHash,receipt:'pending'});
   retryQueue.set(item.id,item);
   // Save locally before live delivery; this copy survives a dropped connection.
   try{await saveOutbox(item,targetRoomHash)}catch(e){console.warn('Could not write local retry record before live send',e)}
@@ -282,8 +295,8 @@ async function syncFromServer(silent=false){
       if(row.sender_id===senderId){
         const el=pending.get(row.message_id);
         if(el){
-          if(row.seen_at){el.textContent='Seen';pending.delete(row.message_id);retryQueue.delete(row.message_id);await removeOutbox(row.message_id)}
-          else if(row.delivered_at){if(el.textContent!=='Seen')el.textContent='Delivered';retryQueue.delete(row.message_id);await removeOutbox(row.message_id)}
+          if(row.seen_at){applyReceipt(row.message_id,'seen');retryQueue.delete(row.message_id);await removeOutbox(row.message_id)}
+          else if(row.delivered_at){applyReceipt(row.message_id,'delivered');retryQueue.delete(row.message_id);await removeOutbox(row.message_id)}
         }
         continue;
       }
