@@ -118,7 +118,7 @@ function applyReceipt(id,status){
   if(el){el.textContent=item.receipt==='seen'?'Seen':'Delivered';if(item.receipt==='seen')pending.delete(item.id)}
  }
 }
-function pushMessage(text,mine,ts,id,state,replyTo=null){if(seen.has(id))return null;seen.add(id);roomMessages.push({text,mine,ts,id,state,replyTo});const el=addBubble(text,mine,ts,state,id,replyTo);if(mine)registerPending(id,el);saveLocal({id,roomHash,roomLabel:roomCode.slice(0,8)+'…',ts,mine,text});return el}
+function pushMessage(text,mine,ts,id,state,replyTo=null){if(seen.has(id))return null;seen.add(id);roomMessages.push({text,mine,ts,id,state,replyTo});const el=addBubble(text,mine,ts,state,id,replyTo);saveLocal({id,roomHash,roomLabel:roomCode.slice(0,8)+'…',ts,mine,text});return el}
 function addPhotoBubble(blob,mine,ts,state='',id=''){
  const wrap=document.createElement('div');wrap.className='msg'+(mine?' mine':'');
  const label=document.createElement('div');label.className='photo-label';label.textContent=mine?'📷 Photo · you':'📷 Photo';wrap.append(label);
@@ -182,8 +182,8 @@ async function persistMessageUntilSaved(item,targetRoomHash){
 }
 async function transmit(item){
   const targetRoomHash=roomHash;
-  registerPending(item.id,item.el);
   if(!outgoingReceipts.some(x=>x.id===item.id&&x.roomHash===targetRoomHash))outgoingReceipts.push({id:item.id,ts:item.ts||Date.now(),roomHash:targetRoomHash,receipt:'pending'});
+  registerPending(item.id,item.el);
   retryQueue.set(item.id,item);
   // Save locally before live delivery; this copy survives a dropped connection.
   try{await saveOutbox(item,targetRoomHash)}catch(e){console.warn('Could not write local retry record before live send',e)}
