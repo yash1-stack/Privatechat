@@ -104,7 +104,8 @@ async function startVoiceRecording(){
  }catch(e){stopMicTracks();recorder=null;$('voiceStatus').textContent=e?.name==='NotAllowedError'?'Microphone permission denied. Allow microphone access for this HTTPS site, then try again.':'Could not start microphone. Check browser permission and retry.';$('recordVoice').disabled=!subscribed;$('stopVoice').disabled=true}
 }
 function stopVoiceRecording(){if(recorder&&recorder.state==='recording'){clearTimeout(recordStopTimer);recorder.stop()}}
-function pushMessage(text,mine,ts,id,state,replyTo=null){if(seen.has(id))return null;seen.add(id);roomMessages.push({text,mine,ts,id,state,replyTo});const el=addBubble(text,mine,ts,state,id,replyTo);if(mine)pending.set(id,el);saveLocal({id,roomHash,roomLabel:roomCode.slice(0,8)+'…',ts,mine,text});return el}
+function registerPending(id,el){if(!id||!el)return;pending.set(id,el);if(earlyRead.delete(id)){el.textContent='Seen';pending.delete(id);earlyDelivered.delete(id)}else if(earlyDelivered.delete(id)){if(el.textContent!=='Seen')el.textContent='Delivered'}}
+function pushMessage(text,mine,ts,id,state,replyTo=null){if(seen.has(id))return null;seen.add(id);roomMessages.push({text,mine,ts,id,state,replyTo});const el=addBubble(text,mine,ts,state,id,replyTo);if(mine)registerPending(id,el);saveLocal({id,roomHash,roomLabel:roomCode.slice(0,8)+'…',ts,mine,text});return el}
 function addPhotoBubble(blob,mine,ts,state='',id=''){
  const wrap=document.createElement('div');wrap.className='msg'+(mine?' mine':'');
  const label=document.createElement('div');label.className='photo-label';label.textContent=mine?'📷 Photo · you':'📷 Photo';wrap.append(label);
@@ -129,6 +130,8 @@ channel.on('broadcast',{event:'photo'},async({payload})=>{try{await processIncom
 channel.on('broadcast',{event:'voice'},async({payload})=>{try{await processIncoming(payload,'voice')}catch(e){setStatus('Could not receive voice note: '+e.message)}});
 channel.on('broadcast',{event:'delivered'},({payload})=>{if(!payload||payload.from===senderId)return;const el=pending.get(payload.id);if(el&&el.textContent!=='Seen')el.textContent='Delivered';else if(!el)earlyDelivered.add(payload.id);});
 channel.on('broadcast',{event:'read'},({payload})=>{if(!payload||payload.from===senderId)return;const el=pending.get(payload.id);if(el){el.textContent='Seen';pending.delete(payload.id);}else earlyRead.add(payload.id)});
+channel.on('broadcast',{event:'delivered-batch'},({payload})=>{if(!payload||payload.from===senderId||!Array.isArray(payload.ids))return;for(const id of payload.ids){const el=pending.get(id);if(el&&el.textContent!=='Seen')el.textContent='Delivered';else if(!el)earlyDelivered.add(id)}});
+channel.on('broadcast',{event:'read-batch'},({payload})=>{if(!payload||payload.from===senderId||!Array.isArray(payload.ids))return;for(const id of payload.ids){const el=pending.get(id);if(el){el.textContent='Seen';pending.delete(id)}else earlyRead.add(id)}});
 
 channel.on('broadcast',{event:'delete-request'},({payload})=>{if(payload&&payload.from!==senderId&&payload.room===roomHash)checkDeleteStatus()});
 channel.on('broadcast',{event:'typing'},({payload})=>{if(payload&&payload.sender!==senderId){$('typing').textContent=payload.active?'Other participant is typing…':'';if(payload.active){clearTimeout(typingTimer);typingTimer=setTimeout(()=>$('typing').textContent='',2500)}}});
@@ -146,7 +149,7 @@ channel.subscribe(async s=>{if(s==='SUBSCRIBED'){subscribed=true;setConn('Connec
 }catch(e){setStatus(e.message||'Could not join room.');setConn('Offline')}}
 async function saveOutbox(item,targetRoomHash=roomHash){const k=await deviceKey(),record={id:item.id,ts:item.ts,kind:item.kind||'text',text:item.text||'',payload:item.payload};const encrypted=await encryptText(JSON.stringify(record),k);await dbPut(OUTBOX_PREFIX+targetRoomHash+':'+item.id,encrypted)}
 async function removeOutbox(id,targetRoomHash=roomHash){try{if(targetRoomHash)await dbDelete(OUTBOX_PREFIX+targetRoomHash+':'+id)}catch(e){console.warn('Could not clear local retry record',e)}}
-async function restoreOutbox(){if(!roomHash||!roomKey)return;try{const k=await deviceKey(),keys=await dbKeys(),prefix=OUTBOX_PREFIX+roomHash+':';for(const key of keys){if(typeof key!=='string'||!key.startsWith(prefix))continue;const id=key.slice(prefix.length);if(retryQueue.has(id)||pending.has(id))continue;try{const raw=await dbGet(key),item=JSON.parse(await decryptText(raw,k));if(!item.ts||Date.now()-item.ts>=86400000){await dbDelete(key);continue;}let el;if(item.kind==='photo'||item.kind==='voice'){const bytes=await decryptBytes(item.payload.data),blob=new Blob([bytes],{type:item.kind==='photo'?'image/jpeg':(item.payload.mime||'audio/webm')});el=item.kind==='photo'?addPhotoBubble(blob,true,item.ts,'Not saved · retry',id):addVoiceBubble(blob,blob.type,true,item.ts,'Not saved · retry',id)}else el=addBubble(item.text,true,item.ts,'Not saved · retry',id);pending.set(id,el);retryQueue.set(id,{...item,el});}catch(e){console.warn('Could not restore a local retry record',e)}}$('retry').disabled=retryQueue.size===0;}catch(e){console.warn('Local retry queue unavailable',e)}}
+async function restoreOutbox(){if(!roomHash||!roomKey)return;try{const k=await deviceKey(),keys=await dbKeys(),prefix=OUTBOX_PREFIX+roomHash+':';for(const key of keys){if(typeof key!=='string'||!key.startsWith(prefix))continue;const id=key.slice(prefix.length);if(retryQueue.has(id)||pending.has(id))continue;try{const raw=await dbGet(key),item=JSON.parse(await decryptText(raw,k));if(!item.ts||Date.now()-item.ts>=86400000){await dbDelete(key);continue;}let el;if(item.kind==='photo'||item.kind==='voice'){const bytes=await decryptBytes(item.payload.data),blob=new Blob([bytes],{type:item.kind==='photo'?'image/jpeg':(item.payload.mime||'audio/webm')});el=item.kind==='photo'?addPhotoBubble(blob,true,item.ts,'Not saved · retry',id):addVoiceBubble(blob,blob.type,true,item.ts,'Not saved · retry',id)}else el=addBubble(item.text,true,item.ts,'Not saved · retry',id);registerPending(id,el);retryQueue.set(id,{...item,el});}catch(e){console.warn('Could not restore a local retry record',e)}}$('retry').disabled=retryQueue.size===0;}catch(e){console.warn('Local retry queue unavailable',e)}}
 function waitForLiveAck(id,ms=2200){return new Promise(resolve=>{let settled=false;const finish=value=>{if(settled)return;settled=true;clearTimeout(timer);liveAckWaiters.delete(id);resolve(value)};const timer=setTimeout(()=>finish(false),ms);liveAckWaiters.set(id,finish)})}
 async function persistMessageUntilSaved(item,targetRoomHash){
   let attempts=0;
@@ -165,7 +168,7 @@ async function persistMessageUntilSaved(item,targetRoomHash){
 }
 async function transmit(item){
   const targetRoomHash=roomHash;
-  pending.set(item.id,item.el);
+  registerPending(item.id,item.el);
   retryQueue.set(item.id,item);
   // Save locally before live delivery; this copy survives a dropped connection.
   try{await saveOutbox(item,targetRoomHash)}catch(e){console.warn('Could not write local retry record before live send',e)}
@@ -255,10 +258,15 @@ async function checkDeleteStatus(){
 }
 async function persistMessage(item){const kind=item.kind||'text';await chatApi('send',{id:item.id,sender:senderId,kind,payload:item.payload});}
 async function acknowledge(ids,status,serverBacked=true){
-  if(!ids.length||!roomCode)return;
-  // Persist the receipt before broadcasting it; live-only receipts can be lost.
-  if(serverBacked){try{await chatApi('ack',{ids,status});if(status==='seen')for(const id of ids)serverBackedIds.delete(id)}catch(e){console.warn('Server acknowledgement pending; it will be retried on sync',e);return;}}
-  if(channel&&subscribed){const event=status==='seen'?'read':'delivered';for(const id of ids)channel.send({type:'broadcast',event,payload:{id,from:senderId,ts:Date.now()}}).catch(()=>{});}
+  const unique=[...new Set((ids||[]).filter(id=>typeof id==='string'&&id))];
+  if(!unique.length||!roomCode)return;
+  // The server accepts at most 100 IDs per request. Send one Realtime event per batch,
+  // not one event per message, to avoid burst rate limits during history reconciliation.
+  for(let i=0;i<unique.length;i+=100){
+    const batch=unique.slice(i,i+100);
+    if(serverBacked){try{await chatApi('ack',{ids:batch,status});if(status==='seen')for(const id of batch)serverBackedIds.delete(id)}catch(e){console.warn('Server acknowledgement pending; it will be retried on sync',e);return;}}
+    if(channel&&subscribed){const event=status==='seen'?'read-batch':'delivered-batch';channel.send({type:'broadcast',event,payload:{ids:batch,from:senderId,ts:Date.now()}}).catch(()=>{});}
+  }
 }
 function rememberSeen(id){seen.add(id);try{localStorage.setItem('private-chat-seen-'+roomHash,JSON.stringify([...seen].slice(-3000)))}catch{}}
 async function processIncoming(payload,kind,source='live',deferAck=false){if(!payload||payload.sender===senderId||!payload.id||seen.has(payload.id)||!payload.data)return;if(source==='server')serverBackedIds.add(payload.id);const ts=payload.ts||Date.now();if(kind==='text'){const text=await decryptText(payload.data);if(seen.has(payload.id))return;let replyTo=null;if(payload.replyData){try{replyTo=JSON.parse(await decryptText(payload.replyData))}catch{}}pushMessage(text,false,ts,payload.id,'Delivered',replyTo)}else{const bytes=await decryptBytes(payload.data);if(seen.has(payload.id))return;const blob=new Blob([bytes],{type:kind==='photo'?'image/jpeg':(payload.mime||'audio/webm')});rememberSeen(payload.id);roomMessages.push({id:payload.id,mine:false,ts,kind});if(kind==='photo')addPhotoBubble(blob,false,ts,'Delivered',payload.id);else addVoiceBubble(blob,blob.type,false,ts,'Delivered',payload.id)}rememberSeen(payload.id);if(!deferAck)await acknowledge([payload.id],document.visibilityState==='visible'?'seen':'delivered',true)}
