@@ -290,7 +290,6 @@ async function syncFromServer(silent=false){
   if(receiptSyncBusy){receiptSyncAgain=true;return true;}
   receiptSyncBusy=true;
   const pendingSeenAcks=[],pendingDeliveredAcks=[];
-  let syncOk=false;
   try{
     const data=await chatApi('fetch');
     for(const row of data.messages||[]){
@@ -322,7 +321,6 @@ async function syncFromServer(silent=false){
     }
     for(let i=0;i<pendingSeenAcks.length;i+=100)await acknowledge(pendingSeenAcks.slice(i,i+100),'seen',true);
     for(let i=0;i<pendingDeliveredAcks.length;i+=100)await acknowledge(pendingDeliveredAcks.slice(i,i+100),'delivered',true);
-    syncOk=true;
     syncFailureCount=0;
     if(!silent)setStatus('Connected. Pending offline messages synced.');
     return true;
@@ -353,7 +351,7 @@ async function clearCurrentChat(){if(!roomHash){$('messages').replaceChildren();
 $('clearScreen').onclick=clearCurrentChat;$('deleteChat').onclick=async()=>{if(!roomCode||!subscribed){setStatus('Connect to the chat first.');return}if(!confirm('Request permanent deletion? The other participant must also confirm within 24 hours.'))return;const b=$('deleteChat');b.disabled=true;try{const result=await chatApi('delete-request');if(result.deleted){await finalizeDeletedChat();}else{setStatus('Your deletion confirmation is saved. The other participant will be notified; waiting for their confirmation.');if(channel&&subscribed)sendRealtime('delete-request',{from:senderId,room:roomHash,at:Date.now()}).catch(()=>{});await checkDeleteStatus();}}catch(e){setStatus('Could not request deletion: '+e.message)}finally{b.disabled=false}};$('forgetPin').onclick=()=>{localStorage.removeItem(LAST_PIN_KEY);$('pinInput').value='';currentChatPin='';setStatus('Saved PIN removed from this device. The chat itself is not deleted.')};$('showHistory').onclick=()=>{$('history').classList.toggle('hidden');if(!$('history').classList.contains('hidden'))renderHistory()};$('historyFilter').oninput=renderHistory;
 $('clearHistory').onclick=async()=>{if(!confirm('Delete all locally saved chat history from this browser? This cannot be undone.'))return;await dbPut(HISTORY_KEY,[]);renderHistory();setStatus('All local history cleared from this browser.')};
 window.addEventListener('online',()=>{if(roomCode&&!subscribed)scheduleAutoReconnect('NETWORK_ONLINE')});
-async function syncOnForeground(){if(foregroundSyncPromise)return foregroundSyncPromise;foregroundSyncPromise=(async()=>{if(!roomCode)return;if(!subscribed){scheduleAutoReconnect('TAB_VISIBLE');return;}try{await chatApi('touch')}catch(e){console.warn('Foreground slot renewal failed; restarting the room connection',e);subscribed=false;setConn('Reconnecting');$('send').disabled=true;$('message').disabled=true;$('pickGallery').disabled=true;$('pickCamera').disabled=true;$('sendPhoto').disabled=true;$('recordVoice').disabled=true;scheduleAutoReconnect('FOREGROUND_TOUCH_FAILED');return;}const ids=roomMessages.filter(m=>!m.mine&&m.id).map(m=>m.id);if(ids.length)await acknowledge(ids,'seen',true);await syncFromServer(false)})();try{await foregroundSyncPromise}finally{foregroundSyncPromise=null}}
+async function syncOnForeground(){if(foregroundSyncPromise)return foregroundSyncPromise;foregroundSyncPromise=(async()=>{if(!roomCode)return;if(!subscribed){scheduleAutoReconnect('TAB_VISIBLE');return;}try{await chatApi('touch')}catch(e){console.warn('Foreground slot renewal failed; restarting the room connection',e);subscribed=false;setConn('Reconnecting');$('send').disabled=true;$('message').disabled=true;$('pickGallery').disabled=true;$('pickCamera').disabled=true;$('sendPhoto').disabled=true;$('recordVoice').disabled=true;scheduleAutoReconnect('FOREGROUND_TOUCH_FAILED');return;}const ids=roomMessages.filter(m=>!m.mine&&m.id).map(m=>m.id);if(ids.length){try{await acknowledge(ids,'seen',true)}catch(e){console.warn('Foreground receipt update failed; continuing message sync',e)}}await syncFromServer(false)})();try{await foregroundSyncPromise}finally{foregroundSyncPromise=null}}
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')syncOnForeground()});
 window.addEventListener('pageshow',()=>{if(document.visibilityState==='visible')syncOnForeground()});
 async function boot(){try{await deviceKey();await loadRecords();}catch{}$('pinInput').value='';currentChatPin='';setStatus('Enter your 6-digit PIN to connect. It is not saved in this browser.');setConn('Offline')};$('pinInput').addEventListener('input',e=>e.target.value=e.target.value.replace(/\D/g,'').slice(0,6));boot();
