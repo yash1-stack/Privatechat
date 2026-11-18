@@ -294,7 +294,8 @@ async function syncFromServer(silent=false){
     for(const row of data.messages||[]){
       if(row.sender_id===senderId){
         const el=pending.get(row.message_id);
-        if(el){
+        const receiptTracked=outgoingReceipts.some(x=>x.id===row.message_id&&x.roomHash===roomHash);
+        if(el||receiptTracked){
           if(row.seen_at){applyReceipt(row.message_id,'seen');retryQueue.delete(row.message_id);await removeOutbox(row.message_id)}
           else if(row.delivered_at){applyReceipt(row.message_id,'delivered');retryQueue.delete(row.message_id);await removeOutbox(row.message_id)}
         }
