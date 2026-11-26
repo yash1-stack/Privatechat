@@ -34,7 +34,7 @@ Deno.serve(async(req)=>{
   if(action==="create"){
    const requestedPin=String(body?.pin||"");
    const customPin=requestedPin.length>0;
-   if(customPin&&!/^\\d{6}$/.test(requestedPin))return json({error:"Choose exactly 6 digits for your personal PIN."},400);
+   if(customPin&&!/^\d{6}$/.test(requestedPin))return json({error:"Choose exactly 6 digits for your personal PIN."},400);
    for(let n=0;n<(customPin?1:20);n++){
     const pin=customPin?requestedPin:pinCode(),pinHash=await sha("pc-pin-v1:"+pin),roomCode=roomSecret();
     const {data:created,error}=await db.from("chat_pin_rooms").insert({pin_hash:pinHash,room_code:roomCode,last_activity_at:new Date().toISOString()}).select("id").single();
